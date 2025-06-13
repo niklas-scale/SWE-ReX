@@ -2,6 +2,7 @@ import logging
 import shutil
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -43,15 +44,24 @@ class RemoteRuntime(AbstractRuntime):
         self,
         *,
         logger: logging.Logger | None = None,
+        max_retries: int = 4,
+        retry_delay: float = 1.0,
+        retry_backoff: float = 2.0,
         **kwargs: Any,
     ):
         """A runtime that connects to a remote server.
-
         Args:
+            max_retries: Maximum number of retries for HTTP requests (default: 3)
+            retry_delay: Initial delay between retries in seconds (default: 1.0)
+            retry_backoff: Backoff multiplier for retry delays (default: 2.0)
             **kwargs: Keyword arguments to pass to the `RemoteRuntimeConfig` constructor.
         """
         self._config = RemoteRuntimeConfig(**kwargs)
         self.logger = logger or get_logger("rex-runtime")
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.retry_backoff = retry_backoff
+
         if not self._config.host.startswith("http"):
             self.logger.warning("Host %s does not start with http, adding http://", self._config.host)
             self._config.host = f"http://{self._config.host}"
@@ -77,6 +87,70 @@ class RemoteRuntime(AbstractRuntime):
         if self._config.port is None:
             return self._config.host
         return f"{self._config.host}:{self._config.port}"
+
+    def _should_retry_exception(self, exc: Exception) -> bool:
+        """Determine if an exception is retryable."""
+        if isinstance(exc, requests.exceptions.ConnectionError):
+            return True
+        if isinstance(exc, requests.exceptions.Timeout):
+            return True
+        if isinstance(exc, requests.exceptions.SSLError):
+            return True
+        if isinstance(exc, requests.exceptions.HTTPError):
+            # Retry on 5xx server errors, but not 4xx client errors
+            if hasattr(exc, 'response') and exc.response is not None:
+                return 500 <= exc.response.status_code < 600
+        return False
+
+    def _should_retry_status_code(self, status_code: int) -> bool:
+        """Determine if a status code is retryable."""
+        # Retry on 5xx server errors and some network-related codes
+        return 500 <= status_code < 600 or status_code in [408, 429]
+
+    def _retry_request(self, request_func, *args, safe_to_retry: bool = True, **kwargs):
+        """Execute a request function with retries."""
+        last_exception = None
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = request_func(*args, **kwargs)
+
+                # Check if we should retry based on status code
+                if (attempt < self.max_retries and 
+                    safe_to_retry and 
+                    self._should_retry_status_code(response.status_code)):
+
+                    delay = self.retry_delay * (self.retry_backoff ** attempt)
+                    self.logger.warning(
+                        "Request failed with status %d, retrying in %.2f seconds (attempt %d/%d)",
+                        response.status_code, delay, attempt + 1, self.max_retries + 1
+                    )
+                    time.sleep(delay)
+                    continue
+
+                return response
+
+            except Exception as exc:
+                last_exception = exc
+
+                if (attempt < self.max_retries and 
+                    safe_to_retry and 
+                    self._should_retry_exception(exc)):
+
+                    delay = self.retry_delay * (self.retry_backoff ** attempt)
+                    self.logger.warning(
+                        "Request failed with %s, retrying in %.2f seconds (attempt %d/%d): %s",
+                        type(exc).__name__, delay, attempt + 1, self.max_retries + 1, str(exc)
+                    )
+                    time.sleep(delay)
+                    continue
+
+                # If not retryable or out of retries, re-raise
+                raise
+
+        # If we get here, we've exhausted retries
+        if last_exception:
+            raise last_exception
 
     def _handle_transfer_exception(self, exc_transfer: _ExceptionTransfer) -> None:
         """Reraise exceptions that were thrown on the remote."""
@@ -124,13 +198,16 @@ class RemoteRuntime(AbstractRuntime):
 
     async def is_alive(self, *, timeout: float | None = None) -> IsAliveResponse:
         """Checks if the runtime is alive.
-
         Internal server errors are thrown, everything else just has us return False
         together with the message.
         """
         try:
-            response = requests.get(
-                f"{self._api_url}/is_alive", headers=self._headers, timeout=self._get_timeout(timeout)
+            response = self._retry_request(
+                requests.get,
+                f"{self._api_url}/is_alive",
+                headers=self._headers,
+                timeout=self._get_timeout(timeout),
+                safe_to_retry=True  # is_alive is safe to retry
             )
             if response.status_code == 200:
                 return IsAliveResponse(**response.json())
@@ -154,57 +231,79 @@ class RemoteRuntime(AbstractRuntime):
     async def wait_until_alive(self, *, timeout: float = 60.0):
         return await _wait_until_alive(self.is_alive, timeout=timeout)
 
-    def _request(self, endpoint: str, request: BaseModel | None, output_class: Any):
+    def _request(self, endpoint: str, request: BaseModel | None, output_class: Any, safe_to_retry: bool = True):
         """Small helper to make requests to the server and handle errors and output."""
-        response = requests.post(
-            f"{self._api_url}/{endpoint}", json=request.model_dump() if request else None, headers=self._headers
+        response = self._retry_request(
+            requests.post,
+            f"{self._api_url}/{endpoint}",
+            json=request.model_dump() if request else None,
+            headers=self._headers,
+            safe_to_retry=safe_to_retry
         )
         self._handle_response_errors(response)
         return output_class(**response.json())
 
     async def create_session(self, request: CreateSessionRequest) -> CreateSessionResponse:
         """Creates a new session."""
-        return self._request("create_session", request, CreateSessionResponse)
+        return self._request("create_session", request, CreateSessionResponse, safe_to_retry=True)
 
     async def run_in_session(self, action: Action) -> Observation:
         """Runs a command in a session."""
-        return self._request("run_in_session", action, Observation)
+        # This is potentially unsafe to retry as it might execute commands twice
+        return self._request("run_in_session", action, Observation, safe_to_retry=False)
 
     async def close_session(self, request: CloseSessionRequest) -> CloseSessionResponse:
         """Closes a shell session."""
-        return self._request("close_session", request, CloseSessionResponse)
+        return self._request("close_session", request, CloseSessionResponse, safe_to_retry=True)
 
     async def execute(self, command: Command) -> CommandResponse:
         """Executes a command (independent of any shell session)."""
-        return self._request("execute", command, CommandResponse)
+        # This is potentially unsafe to retry as it might execute commands twice
+        return self._request("execute", command, CommandResponse, safe_to_retry=False)
 
     async def read_file(self, request: ReadFileRequest) -> ReadFileResponse:
         """Reads a file"""
-        return self._request("read_file", request, ReadFileResponse)
+        return self._request("read_file", request, ReadFileResponse, safe_to_retry=True)
 
     async def write_file(self, request: WriteFileRequest) -> WriteFileResponse:
         """Writes a file"""
-        return self._request("write_file", request, WriteFileResponse)
+        # File writes could be unsafe to retry depending on the write mode
+        # Being conservative and not retrying by default
+        return self._request("write_file", request, WriteFileResponse, safe_to_retry=False)
 
     async def upload(self, request: UploadRequest) -> UploadResponse:
         """Uploads a file"""
         source = Path(request.source_path).resolve()
         self.logger.debug("Uploading file from %s to %s", request.source_path, request.target_path)
+
+        def _upload_request(files, data):
+            return requests.post(f"{self._api_url}/upload", files=files, data=data, headers=self._headers)
+
         if source.is_dir():
-            with tempfile.TemporaryDirectory() as temp_dir:
+            # Ignore cleanup errors: See https://github.com/SWE-agent/SWE-agent/issues/1005
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
                 zip_path = Path(temp_dir) / "zipped_transfer.zip"
                 shutil.make_archive(str(zip_path.with_suffix("")), "zip", source)
                 self.logger.debug("Created zip file at %s", zip_path)
                 files = {"file": zip_path.open("rb")}
                 data = {"target_path": request.target_path, "unzip": "true"}
-                response = requests.post(f"{self._api_url}/upload", files=files, data=data, headers=self._headers)
+
+                # Uploads might be unsafe to retry if they partially succeed
+                response = self._retry_request(
+                    _upload_request, files, data, safe_to_retry=False
+                )
                 self._handle_response_errors(response)
                 return UploadResponse(**response.json())
+
         elif source.is_file():
             self.logger.debug("Uploading file from %s to %s", source, request.target_path)
             files = {"file": source.open("rb")}
             data = {"target_path": request.target_path, "unzip": "false"}
-            response = requests.post(f"{self._api_url}/upload", files=files, data=data, headers=self._headers)
+
+            # Uploads might be unsafe to retry if they partially succeed
+            response = self._retry_request(
+                _upload_request, files, data, safe_to_retry=False
+            )
             self._handle_response_errors(response)
             return UploadResponse(**response.json())
         else:
@@ -213,4 +312,4 @@ class RemoteRuntime(AbstractRuntime):
 
     async def close(self) -> CloseResponse:
         """Closes the runtime."""
-        return self._request("close", None, CloseResponse)
+        return self._request("close", None, CloseResponse, safe_to_retry=True)
