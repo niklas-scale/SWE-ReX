@@ -67,26 +67,21 @@ class _ImageBuilder:
     def from_ecr(self, image: str) -> modal.Image:
         self.logger.info(f"Building image from ECR {image}")
         try:
-            session = boto3.Session()
-            credentials = session.get_credentials()
-            aws_access_key_id = credentials.access_key
-            aws_secret_access_key = credentials.secret_key
-            secret = modal.Secret.from_dict(
-                {
-                    "AWS_ACCESS_KEY_ID": aws_access_key_id,
-                    "AWS_SECRET_ACCESS_KEY": aws_secret_access_key,
-                }
-            )
-            return modal.Image.from_ecr(  # type: ignore
+            # Build image for SWEAP instances
+            # TODO: Expand for more use cases rather than just SWEAP
+            return modal.Image.from_aws_ecr(  # type: ignore
                 image,
-                secrets=[secret],
+                secret=modal.Secret.from_name("aws-secret-ml-xiang-deng"),
             )
         except NoCredentialsError as e:
             msg = "AWS credentials not found. Please configure your AWS credentials."
             raise ValueError(msg) from e
 
     def ensure_pipx_installed(self, image: modal.Image) -> modal.Image:
-        image = image.apt_install("pipx")
+        image = image\
+            .run_commands("pip config unset global.index-url || true") \
+            .apt_install("pipx") \
+            .run_commands(f"pipx install {PACKAGE_NAME}")
         return image.run_commands("pipx ensurepath")
 
     def auto(self, image_spec: str | modal.Image | PurePath) -> modal.Image:
@@ -118,10 +113,10 @@ class ModalDeployment(AbstractDeployment):
         logger: logging.Logger | None = None,
         image: str | modal.Image | PurePath,
         startup_timeout: float = 0.4,
-        runtime_timeout: float = 1800.0,
+        runtime_timeout: float = 3600.0,
         modal_sandbox_kwargs: dict[str, Any] | None = None,
         install_pipx: bool = True,
-        deployment_timeout: float = 1800.0,
+        deployment_timeout: float = 3600.0,
     ):
         """Deployment for modal.com. The deployment will only start when the
         `start` method is being called.
