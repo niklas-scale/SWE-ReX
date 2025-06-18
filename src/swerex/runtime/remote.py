@@ -123,7 +123,10 @@ class RemoteRuntime(AbstractRuntime):
     def _get_retry_decorator(self, safe_to_retry: bool = True) -> Any:
         """Returns a tenacity retry decorator based on the instance's configuration."""
         if not safe_to_retry:
-            return None  # No retry for unsafe operations
+            # Return a no-op decorator if the function is not safe to retry.
+            def no_op_decorator(func):
+                return func
+            return no_op_decorator
 
         return retry(
             stop=stop_after_attempt(self.max_retries + 1),
