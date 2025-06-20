@@ -67,6 +67,9 @@ class _ImageBuilder:
     def from_ecr(self, image: str) -> modal.Image:
         self.logger.info(f"Building image from ECR {image}")
         try:
+            # Build image for SWEAP instances
+            # TODO: Expand for more use cases rather than just SWEAP
+            # TODO: Move AWS Secret from a username specific name to a generic one
             return modal.Image.from_aws_ecr(  # type: ignore
                 image,
                 secret=modal.Secret.from_name(os.environ.get("MODAL_AWS_SECRET_NAME", "aws-secret-ml-xiang-deng")),
