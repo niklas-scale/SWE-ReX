@@ -69,6 +69,7 @@ class _ImageBuilder:
         try:
             # Build image for SWEAP instances
             # TODO: Expand for more use cases rather than just SWEAP
+            # TODO: Move AWS Secret from a username specific name to a generic one
             return modal.Image.from_aws_ecr(  # type: ignore
                 image,
                 secret=modal.Secret.from_name("aws-secret-ml-xiang-deng"),
