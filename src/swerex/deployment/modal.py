@@ -72,18 +72,26 @@ class _ImageBuilder:
             # TODO: Move AWS Secret from a username specific name to a generic one
             return modal.Image.from_aws_ecr(  # type: ignore
                 image,
-                secret=modal.Secret.from_name("aws-secret-ml-xiang-deng"),
+                secret=modal.Secret.from_name(os.environ.get("MODAL_AWS_SECRET_NAME", "aws-secret-ml-xiang-deng")),
+                setup_dockerfile_commands=["RUN apt update && apt install -y pip || true", "RUN python -m pip config set global.break-system-packages true || true"]
             )
         except NoCredentialsError as e:
             msg = "AWS credentials not found. Please configure your AWS credentials."
             raise ValueError(msg) from e
 
     def ensure_pipx_installed(self, image: modal.Image) -> modal.Image:
+
         image = image\
             .run_commands("pip config unset global.index-url || true") \
-            .apt_install("pipx") \
-            .run_commands(f"pipx install {PACKAGE_NAME}")
-        return image.run_commands("pipx ensurepath")
+            .run_commands("apt update && apt install -y curl") \
+            .run_commands("curl https://pyenv.run | bash") \
+            .run_commands("apt update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -y install tzdata && apt install -y make build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev curl git libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev") \
+            .run_commands("~/.pyenv/bin/pyenv install 3.11.13") \
+            .run_commands("~/.pyenv/versions/3.11.13/bin/python3.11 -m pip install pipx") \
+            .run_commands("~/.pyenv/versions/3.11.13/bin/python3.11 -m pipx ensurepath") \
+            .entrypoint([])
+
+        return image
 
     def auto(self, image_spec: str | modal.Image | PurePath) -> modal.Image:
         if isinstance(image_spec, modal.Image):
@@ -191,7 +199,7 @@ class ModalDeployment(AbstractDeployment):
         install pipx and then run swerex-server with pipx run
         """
         rex_args = f"--port {self._port} --auth-token {token}"
-        return f"{REMOTE_EXECUTABLE_NAME} {rex_args} || pipx run {PACKAGE_NAME} {rex_args}"
+        return f"{REMOTE_EXECUTABLE_NAME} {rex_args} || ~/.pyenv/versions/3.11.13/bin/python3.11 -m pipx run {PACKAGE_NAME} {rex_args}"
 
     def get_modal_log_url(self) -> str:
         """Returns URL to modal logs
