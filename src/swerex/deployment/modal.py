@@ -121,7 +121,7 @@ class ModalDeployment(AbstractDeployment):
         *,
         logger: logging.Logger | None = None,
         image: str | modal.Image | PurePath,
-        startup_timeout: float = 0.4,
+        startup_timeout: float = 10.0,
         runtime_timeout: float = 3600.0,
         modal_sandbox_kwargs: dict[str, Any] | None = None,
         install_pipx: bool = True,
