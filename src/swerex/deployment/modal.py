@@ -67,30 +67,56 @@ class _ImageBuilder:
     def from_ecr(self, image: str) -> modal.Image:
         self.logger.info(f"Building image from ECR {image}")
         try:
-            # Build image for SWEAP instances
-            # TODO: Expand for more use cases rather than just SWEAP
-            # TODO: Move AWS Secret from a username specific name to a generic one
             return modal.Image.from_aws_ecr(  # type: ignore
                 image,
                 secret=modal.Secret.from_name(os.environ.get("MODAL_AWS_SECRET_NAME", "aws-secret-ml-xiang-deng")),
-                setup_dockerfile_commands=["RUN apt update && apt install -y pip || true", "RUN python -m pip config set global.break-system-packages true || true"]
+                setup_dockerfile_commands=[
+                    "RUN if command -v apt >/dev/null 2>&1; then apt update && apt install -y pip; elif command -v apk >/dev/null 2>&1; then apk update && apk add --no-cache py3-pip; fi || true", 
+                    "RUN python -m pip config set global.break-system-packages true || true"
+                ]
             )
         except NoCredentialsError as e:
             msg = "AWS credentials not found. Please configure your AWS credentials."
             raise ValueError(msg) from e
 
+
+
     def ensure_pipx_installed(self, image: modal.Image) -> modal.Image:
-
-        image = image\
-            .run_commands("pip config unset global.index-url || true") \
-            .run_commands("apt update && apt install -y curl") \
-            .run_commands("curl https://pyenv.run | bash") \
-            .run_commands("apt update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -y install tzdata && apt install -y make build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev curl git libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev") \
-            .run_commands("~/.pyenv/bin/pyenv install 3.11.13") \
-            .run_commands("~/.pyenv/versions/3.11.13/bin/python3.11 -m pip install pipx") \
-            .run_commands("~/.pyenv/versions/3.11.13/bin/python3.11 -m pipx ensurepath") \
-            .entrypoint([])
-
+        """Install pipx using either apt or apk package manager, whichever is available."""
+        
+        # Use individual run_commands instead of a complex script to avoid Dockerfile parsing issues
+        image = image.run_commands("pip config unset global.index-url || true")
+        
+        # Install curl and basic tools - try apt first, then apk
+        image = image.run_commands(
+            "if command -v apt >/dev/null 2>&1; then "
+            "apt update && apt install -y curl; "
+            "elif command -v apk >/dev/null 2>&1; then "
+            "apk update && apk add --no-cache curl bash; "
+            "else echo 'No package manager found' && exit 1; fi"
+        )
+        
+        # Install pyenv
+        image = image.run_commands("curl https://pyenv.run | bash")
+        
+        # Install build dependencies - try apt first, then apk
+        image = image.run_commands(
+            "if command -v apt >/dev/null 2>&1; then "
+            "apt update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -y install tzdata && "
+            "apt install -y make build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev git libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev; "
+            "elif command -v apk >/dev/null 2>&1; then "
+            "apk update && apk add --no-cache make gcc musl-dev openssl-dev zlib-dev bzip2-dev readline-dev sqlite-dev git ncurses-dev xz tk-dev libxml2-dev xmlsec-dev libffi-dev xz-dev; "
+            "fi"
+        )
+        
+        # Install Python 3.11.13
+        image = image.run_commands("~/.pyenv/bin/pyenv install 3.11.13")
+        
+        # Install and setup pipx
+        image = image.run_commands("~/.pyenv/versions/3.11.13/bin/python3.11 -m pip install pipx")
+        image = image.run_commands("~/.pyenv/versions/3.11.13/bin/python3.11 -m pipx ensurepath")
+        
+        image = image.entrypoint([])
         return image
 
     def auto(self, image_spec: str | modal.Image | PurePath) -> modal.Image:
@@ -121,11 +147,11 @@ class ModalDeployment(AbstractDeployment):
         *,
         logger: logging.Logger | None = None,
         image: str | modal.Image | PurePath,
-        startup_timeout: float = 10.0,
-        runtime_timeout: float = 3600.0,
+        startup_timeout: float = 0.4,
+        runtime_timeout: float = 1800.0,
         modal_sandbox_kwargs: dict[str, Any] | None = None,
         install_pipx: bool = True,
-        deployment_timeout: float = 3600.0,
+        deployment_timeout: float = 1800.0,
     ):
         """Deployment for modal.com. The deployment will only start when the
         `start` method is being called.
